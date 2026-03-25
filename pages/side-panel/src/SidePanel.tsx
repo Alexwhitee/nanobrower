@@ -4,13 +4,25 @@ import { RxDiscordLogo } from 'react-icons/rx';
 import { FiSettings } from 'react-icons/fi';
 import { PiPlusBold } from 'react-icons/pi';
 import { GrHistory } from 'react-icons/gr';
-import { type Message, Actors, chatHistoryStore, agentModelStore, generalSettingsStore } from '@extension/storage';
+import {
+  type Message,
+  Actors,
+  chatHistoryStore,
+  agentModelStore,
+  generalSettingsStore,
+  remoteSettingsStore,
+  type RemoteSettingsConfig,
+  DEFAULT_REMOTE_SETTINGS,
+} from '@extension/storage';
+import type { RemoteCommandEnvelope, RemoteCommandResult, RemoteConfirmationRequest, RemoteStatusSnapshot } from '@extension/shared';
 import favoritesStorage, { type FavoritePrompt } from '@extension/storage/lib/prompt/favorites';
 import { t } from '@extension/i18n';
 import MessageList from './components/MessageList';
 import ChatInput from './components/ChatInput';
 import ChatHistoryList from './components/ChatHistoryList';
 import BookmarkList from './components/BookmarkList';
+import RemoteControlPanel from './components/RemoteControlPanel';
+import RemoteConfirmationModal from './components/RemoteConfirmationModal';
 import { EventType, type AgentEvent, ExecutionState } from './types/event';
 import './SidePanel.css';
 
@@ -38,6 +50,9 @@ const SidePanel = () => {
   const [isProcessingSpeech, setIsProcessingSpeech] = useState(false);
   const [isReplaying, setIsReplaying] = useState(false);
   const [replayEnabled, setReplayEnabled] = useState(false);
+  const [remoteSettings, setRemoteSettings] = useState<RemoteSettingsConfig>(DEFAULT_REMOTE_SETTINGS);
+  const [remoteStatus, setRemoteStatus] = useState<RemoteStatusSnapshot | null>(null);
+  const [pendingConfirmation, setPendingConfirmation] = useState<RemoteConfirmationRequest | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const isReplayingRef = useRef<boolean>(false);
   const portRef = useRef<chrome.runtime.Port | null>(null);
@@ -64,6 +79,14 @@ const SidePanel = () => {
   // Check if models are configured
   const checkModelConfiguration = useCallback(async () => {
     try {
+      const remoteSettings = await remoteSettingsStore.getSettings();
+      setRemoteSettings(remoteSettings);
+
+      if (remoteSettings.executionMode === 'remote') {
+        setHasConfiguredModels(true);
+        return;
+      }
+
       const configuredAgents = await agentModelStore.getConfiguredAgents();
 
       // Check if at least one agent (preferably Navigator) is configured
@@ -91,6 +114,14 @@ const SidePanel = () => {
     checkModelConfiguration();
     loadGeneralSettings();
   }, [checkModelConfiguration, loadGeneralSettings]);
+
+  useEffect(() => {
+    remoteSettingsStore.getSettings().then(setRemoteSettings).catch(console.error);
+    const unsubscribe = remoteSettingsStore.subscribe(() => {
+      remoteSettingsStore.getSettings().then(setRemoteSettings).catch(console.error);
+    });
+    return unsubscribe;
+  }, []);
 
   // Re-check model configuration when the side panel becomes visible again
   useEffect(() => {
@@ -333,6 +364,32 @@ const SidePanel = () => {
             timestamp: Date.now(),
           });
           setIsProcessingSpeech(false);
+        } else if (message && message.type === 'remote_status') {
+          setRemoteStatus(message.data as RemoteStatusSnapshot);
+        } else if (message && message.type === 'remote_command_event') {
+          const command = message.data as RemoteCommandEnvelope;
+          appendMessage({
+            actor: Actors.SYSTEM,
+            content: `Remote command: ${command.action}`,
+            timestamp: Date.now(),
+          });
+        } else if (message && message.type === 'remote_command_result') {
+          const result = message.data as RemoteCommandResult;
+          appendMessage({
+            actor: Actors.SYSTEM,
+            content: result.ok
+              ? `Remote result: ${result.payload?.message || result.command_id}`
+              : `Remote error: ${result.error || 'unknown error'}`,
+            timestamp: Date.now(),
+          });
+        } else if (message && message.type === 'remote_confirmation_request') {
+          const request = message.data as RemoteConfirmationRequest;
+          setPendingConfirmation(request);
+          appendMessage({
+            actor: Actors.SYSTEM,
+            content: `Remote confirmation required: ${request.message}`,
+            timestamp: Date.now(),
+          });
         } else if (message && message.type === 'heartbeat_ack') {
           console.log('Heartbeat acknowledged');
         }
@@ -367,6 +424,8 @@ const SidePanel = () => {
           stopConnection(); // Stop if port is invalid
         }
       }, 25000);
+
+      portRef.current.postMessage({ type: 'remote_status_snapshot' });
     } catch (error) {
       console.error('Failed to establish connection:', error);
       appendMessage({
@@ -396,6 +455,13 @@ const SidePanel = () => {
     },
     [stopConnection],
   );
+
+  useEffect(() => {
+    setupConnection();
+    return () => {
+      stopConnection();
+    };
+  }, [setupConnection, stopConnection]);
 
   // Handle replay command
   const handleReplay = async (historySessionId: string): Promise<void> => {
@@ -557,6 +623,15 @@ const SidePanel = () => {
 
     if (!trimmedText) return;
 
+    if (remoteSettings.executionMode === 'remote') {
+      appendMessage({
+        actor: Actors.SYSTEM,
+        content: 'Remote mode is enabled. Start the task from OpenClaw / Bridge instead of local chat.',
+        timestamp: Date.now(),
+      });
+      return;
+    }
+
     // Check if the input is a command (starts with /)
     if (trimmedText.startsWith('/')) {
       // Process command and return if it was handled
@@ -660,6 +735,53 @@ const SidePanel = () => {
     setInputEnabled(true);
     setShowStopButton(false);
   };
+
+  const updateRemoteSetting = useCallback(
+    async <K extends keyof RemoteSettingsConfig>(key: K, value: RemoteSettingsConfig[K]) => {
+      const nextSettings = {
+        ...remoteSettings,
+        [key]: value,
+      };
+      setRemoteSettings(nextSettings);
+      await remoteSettingsStore.updateSettings({ [key]: value } as Partial<RemoteSettingsConfig>);
+      if (portRef.current) {
+        portRef.current.postMessage({
+          type: 'remote_status_snapshot',
+        });
+      }
+      if (key === 'executionMode') {
+        await checkModelConfiguration();
+      }
+    },
+    [remoteSettings, checkModelConfiguration],
+  );
+
+  const handleRemoteConnect = useCallback(() => {
+    if (!portRef.current) {
+      setupConnection();
+    }
+    portRef.current?.postMessage({ type: 'remote_connect' });
+  }, [setupConnection]);
+
+  const handleRemoteDisconnect = useCallback(() => {
+    portRef.current?.postMessage({ type: 'remote_disconnect' });
+  }, []);
+
+  const handleConfirmationResponse = useCallback((decision: 'approve' | 'reject' | 'stop') => {
+    if (!pendingConfirmation) {
+      return;
+    }
+    portRef.current?.postMessage({
+      type: 'remote_confirmation_response',
+      response: {
+        confirmation_id: pendingConfirmation.confirmation_id,
+        session_id: pendingConfirmation.session_id,
+        command_id: pendingConfirmation.command_id,
+        decision,
+      },
+    });
+    setPendingConfirmation(null);
+  }, [pendingConfirmation]);
 
   const handleNewChat = () => {
     // Clear messages and start a new chat
@@ -1071,8 +1193,41 @@ const SidePanel = () => {
           </div>
         ) : (
           <>
+            {remoteSettings.executionMode === 'remote' && (
+              <RemoteControlPanel
+                settings={remoteSettings}
+                status={remoteStatus}
+                isDarkMode={isDarkMode}
+                onUpdateSetting={updateRemoteSetting}
+                onConnect={handleRemoteConnect}
+                onDisconnect={handleRemoteDisconnect}
+              />
+            )}
+
+            {remoteSettings.executionMode === 'remote' && (
+              <>
+                <div
+                  className={`scrollbar-gutter-stable flex-1 overflow-x-hidden overflow-y-scroll scroll-smooth p-2 ${isDarkMode ? 'bg-slate-900/80' : ''}`}>
+                  {messages.length === 0 ? (
+                    <div
+                      className={`mx-2 rounded-xl border p-4 text-sm ${isDarkMode ? 'border-slate-700 bg-slate-800 text-slate-300' : 'border-sky-100 bg-white/90 text-slate-600'}`}>
+                      OpenClaw / Bridge commands will appear here. Keep this panel open if you want to approve sensitive actions locally.
+                    </div>
+                  ) : (
+                    <MessageList messages={messages} isDarkMode={isDarkMode} />
+                  )}
+                  <div ref={messagesEndRef} />
+                </div>
+                <RemoteConfirmationModal
+                  request={pendingConfirmation}
+                  isDarkMode={isDarkMode}
+                  onRespond={handleConfirmationResponse}
+                />
+              </>
+            )}
+
             {/* Show loading state while checking model configuration */}
-            {hasConfiguredModels === null && (
+            {remoteSettings.executionMode !== 'remote' && hasConfiguredModels === null && (
               <div
                 className={`flex flex-1 items-center justify-center p-8 ${isDarkMode ? 'text-sky-300' : 'text-sky-600'}`}>
                 <div className="text-center">
@@ -1083,7 +1238,7 @@ const SidePanel = () => {
             )}
 
             {/* Show setup message when no models are configured */}
-            {hasConfiguredModels === false && (
+            {remoteSettings.executionMode !== 'remote' && hasConfiguredModels === false && (
               <div
                 className={`flex flex-1 items-center justify-center p-8 ${isDarkMode ? 'text-sky-300' : 'text-sky-600'}`}>
                 <div className="max-w-md text-center">
@@ -1121,7 +1276,7 @@ const SidePanel = () => {
             )}
 
             {/* Show normal chat interface when models are configured */}
-            {hasConfiguredModels === true && (
+            {remoteSettings.executionMode !== 'remote' && hasConfiguredModels === true && (
               <>
                 {messages.length === 0 && (
                   <>

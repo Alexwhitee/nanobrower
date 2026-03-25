@@ -6,6 +6,7 @@ import {
   generalSettingsStore,
   llmProviderStore,
   analyticsSettingsStore,
+  remoteSettingsStore,
 } from '@extension/storage';
 import { t } from '@extension/i18n';
 import BrowserContext from './browser/context';
@@ -18,6 +19,8 @@ import { DEFAULT_AGENT_OPTIONS } from './agent/types';
 import { SpeechToTextService } from './services/speechToText';
 import { injectBuildDomTreeScripts } from './browser/dom/service';
 import { analytics } from './services/analytics';
+import { RemoteConnectionManager } from './remote/connectionManager';
+import type { RemoteConfirmationResponse } from '@extension/shared';
 
 const logger = createLogger('background');
 
@@ -25,6 +28,14 @@ const browserContext = new BrowserContext({});
 let currentExecutor: Executor | null = null;
 let currentPort: chrome.runtime.Port | null = null;
 const SIDE_PANEL_URL = chrome.runtime.getURL('side-panel/index.html');
+const remoteConnectionManager = new RemoteConnectionManager({
+  browserContext,
+  notifyUI: message => {
+    if (currentPort) {
+      currentPort.postMessage(message);
+    }
+  },
+});
 
 // Setup side panel behavior
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(error => console.error(error));
@@ -53,6 +64,7 @@ chrome.tabs.onRemoved.addListener(tabId => {
 });
 
 logger.info('background loaded');
+void remoteConnectionManager.initialize();
 
 // Initialize analytics
 analytics.init().catch(error => {
@@ -86,6 +98,7 @@ chrome.runtime.onConnect.addListener(port => {
     }
 
     currentPort = port;
+    port.postMessage({ type: 'remote_status', data: remoteConnectionManager.getStatus() });
 
     port.onMessage.addListener(async message => {
       try {
@@ -93,6 +106,30 @@ chrome.runtime.onConnect.addListener(port => {
           case 'heartbeat':
             // Acknowledge heartbeat
             port.postMessage({ type: 'heartbeat_ack' });
+            break;
+
+          case 'remote_status_snapshot':
+            port.postMessage({ type: 'remote_status', data: remoteConnectionManager.getStatus() });
+            break;
+
+          case 'remote_connect':
+            await remoteConnectionManager.connectNow();
+            port.postMessage({ type: 'remote_status', data: remoteConnectionManager.getStatus() });
+            break;
+
+          case 'remote_disconnect':
+            remoteConnectionManager.disconnect();
+            port.postMessage({ type: 'remote_status', data: remoteConnectionManager.getStatus() });
+            break;
+
+          case 'remote_update_settings':
+            await remoteSettingsStore.updateSettings(message.settings ?? {});
+            port.postMessage({ type: 'remote_status', data: remoteConnectionManager.getStatus() });
+            break;
+
+          case 'remote_confirmation_response':
+            remoteConnectionManager.resolveConfirmation(message.response as RemoteConfirmationResponse);
+            port.postMessage({ type: 'success' });
             break;
 
           case 'new_task': {
