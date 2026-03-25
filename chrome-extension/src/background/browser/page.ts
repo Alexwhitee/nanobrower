@@ -13,6 +13,8 @@ import type { ElementHandle } from 'puppeteer-core/lib/esm/puppeteer/api/Element
 import type { Frame } from 'puppeteer-core/lib/esm/puppeteer/api/Frame.js';
 import {
   getClickableElements as _getClickableElements,
+  getMarkdownContent as _getMarkdownContent,
+  getReadabilityContent as _getReadabilityContent,
   removeHighlights as _removeHighlights,
   getScrollInfo as _getScrollInfo,
 } from './dom/service';
@@ -67,6 +69,53 @@ export default class Page {
   private _validWebPage = false;
   private _cachedState: PageState | null = null;
   private _cachedStateClickableElementsHashes: CachedStateClickableElementsHashes | null = null;
+  private _consoleMessages: Array<{ type: string; text: string; location?: string; timestamp: number }> = [];
+  private _pendingDialogPolicy: { accept: boolean; promptText?: string } | null = null;
+  private readonly _boundConsoleListener = (message: { type: () => string; text: () => string; location?: () => unknown }) => {
+    try {
+      const location = typeof message.location === 'function' ? message.location() : null;
+      const locationRecord = location && typeof location === 'object' ? (location as Record<string, unknown>) : null;
+      const locationText =
+        locationRecord
+          ? [locationRecord.url, locationRecord.lineNumber, locationRecord.columnNumber].filter(Boolean).join(':')
+          : '';
+      this._consoleMessages.push({
+        type: message.type(),
+        text: message.text(),
+        location: locationText || undefined,
+        timestamp: Date.now(),
+      });
+      this._consoleMessages = this._consoleMessages.slice(-200);
+    } catch (error) {
+      logger.debug('Failed to capture console message', error);
+    }
+  };
+  private readonly _boundDialogListener = async (dialog: {
+    type: () => string;
+    message: () => string;
+    accept: (promptText?: string) => Promise<void>;
+    dismiss: () => Promise<void>;
+  }) => {
+    const policy = this._pendingDialogPolicy;
+    this._pendingDialogPolicy = null;
+    if (!policy) {
+      logger.info('Dialog opened without pending policy', {
+        type: dialog.type(),
+        message: dialog.message(),
+      });
+      return;
+    }
+
+    try {
+      if (policy.accept) {
+        await dialog.accept(policy.promptText);
+      } else {
+        await dialog.dismiss();
+      }
+    } catch (error) {
+      logger.error('Failed to apply dialog policy', error);
+    }
+  };
 
   constructor(tabId: number, url: string, title: string, config: Partial<BrowserContextConfig> = {}) {
     this._tabId = tabId;
@@ -113,6 +162,9 @@ export default class Page {
 
     const [page] = await browser.pages();
     this._puppeteerPage = page;
+    this._consoleMessages = [];
+    this._puppeteerPage.on('console', this._boundConsoleListener);
+    this._puppeteerPage.on('dialog', this._boundDialogListener);
 
     // Add anti-detection scripts
     await this._addAntiDetectionScripts();
@@ -164,6 +216,10 @@ export default class Page {
 
   async detachPuppeteer(): Promise<void> {
     if (this._browser) {
+      if (this._puppeteerPage) {
+        this._puppeteerPage.off('console', this._boundConsoleListener);
+        this._puppeteerPage.off('dialog', this._boundDialogListener);
+      }
       await this._browser.disconnect();
       this._browser = null;
       this._puppeteerPage = null;
@@ -483,6 +539,94 @@ export default class Page {
     }
   }
 
+  async takeElementScreenshot(elementNode: DOMElementNode): Promise<string | null> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer page is not connected');
+    }
+
+    const element = await this.locateElement(elementNode);
+    if (!element) {
+      throw new Error(`Element not found for screenshot: ${elementNode}`);
+    }
+
+    await this._scrollIntoViewIfNeeded(element);
+    const screenshot = await element.screenshot({
+      encoding: 'base64',
+      type: 'jpeg',
+      quality: 80,
+    });
+    return screenshot as string;
+  }
+
+  armNextDialog(accept: boolean, promptText?: string): void {
+    this._pendingDialogPolicy = {
+      accept,
+      promptText,
+    };
+  }
+
+  async evaluateScript(fnText: string): Promise<unknown> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer page is not connected');
+    }
+
+    return await this._puppeteerPage.evaluate(source => {
+      const evaluated = (0, eval)(source);
+      if (typeof evaluated === 'function') {
+        return evaluated();
+      }
+      return evaluated;
+    }, fnText);
+  }
+
+  getConsoleMessages(level?: string, limit?: number): Array<{ type: string; text: string; location?: string; timestamp: number }> {
+    const normalizedLevel = typeof level === 'string' ? level.trim().toLowerCase() : '';
+    const filtered = normalizedLevel
+      ? this._consoleMessages.filter(message => message.type.toLowerCase() === normalizedLevel)
+      : this._consoleMessages;
+    if (typeof limit === 'number' && Number.isFinite(limit) && limit > 0) {
+      return filtered.slice(-Math.floor(limit));
+    }
+    return [...filtered];
+  }
+
+  async printToPdf(): Promise<string> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer page is not connected');
+    }
+
+    try {
+      const target = this._puppeteerPage.target() as {
+        createCDPSession?: () => Promise<{ send: (method: string, params?: Record<string, unknown>) => Promise<unknown> }>;
+      };
+      if (!target?.createCDPSession) {
+        throw new Error('unsupported_pdf_in_attached_browser');
+      }
+      const cdp = await target.createCDPSession();
+      const result = (await cdp.send('Page.printToPDF', {
+        printBackground: true,
+      })) as { data?: string };
+      if (!result?.data) {
+        throw new Error('unsupported_pdf_in_attached_browser');
+      }
+      return result.data;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('printToPDF') || message.includes('unsupported_pdf_in_attached_browser')) {
+        throw new Error('unsupported_pdf_in_attached_browser');
+      }
+      throw error;
+    }
+  }
+
+  async getMarkdownContent(selector?: string): Promise<string> {
+    return await _getMarkdownContent(this._tabId, selector);
+  }
+
+  async getReadabilityContent() {
+    return await _getReadabilityContent(this._tabId);
+  }
+
   url(): string {
     if (this._puppeteerPage) {
       return this._puppeteerPage.url();
@@ -524,6 +668,73 @@ export default class Page {
       logger.error('Navigation failed:', error);
       throw error;
     }
+  }
+
+  async waitForSelector(selector: string, timeoutMs = 3000): Promise<void> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer page is not connected');
+    }
+    await this._puppeteerPage.waitForSelector(selector, {
+      timeout: timeoutMs,
+      visible: false,
+    });
+  }
+
+  async waitForUrl(url: string, timeoutMs = 3000): Promise<void> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer page is not connected');
+    }
+
+    const expected = url.trim();
+    await this._puppeteerPage.waitForFunction(
+      targetUrl => window.location.href === targetUrl || window.location.href.includes(targetUrl),
+      {
+        timeout: timeoutMs,
+      },
+      expected,
+    );
+  }
+
+  async waitForFunction(fnText: string, timeoutMs = 3000): Promise<void> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer page is not connected');
+    }
+    await this._puppeteerPage.waitForFunction(source => {
+      const evaluated = (0, eval)(source);
+      if (typeof evaluated === 'function') {
+        return Boolean(evaluated());
+      }
+      return Boolean(evaluated);
+    }, {
+      timeout: timeoutMs,
+    }, fnText);
+  }
+
+  async waitForLoadState(loadState: string, timeoutMs = 8000): Promise<void> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer page is not connected');
+    }
+
+    if (loadState === 'networkidle') {
+      await this.waitForPageAndFramesLoad();
+      return;
+    }
+
+    if (loadState === 'domcontentloaded') {
+      await this._puppeteerPage.waitForFunction(() => document.readyState !== 'loading', {
+        timeout: timeoutMs,
+      });
+      return;
+    }
+
+    if (loadState === 'load') {
+      await this._puppeteerPage.waitForFunction(() => document.readyState === 'complete', {
+        timeout: timeoutMs,
+      });
+      return;
+    }
+
+    throw new Error(`Unsupported load state: ${loadState}`);
   }
 
   async refreshPage(): Promise<void> {
@@ -756,6 +967,38 @@ export default class Page {
         }
       }
     }
+  }
+
+  async pressKey(key: string): Promise<void> {
+    await this.sendKeys(key);
+  }
+
+  async pressKeyOnElement(index: number, key: string): Promise<void> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer page is not connected');
+    }
+
+    const element = await this.getElementByIndex(index);
+    if (!element) {
+      throw new Error(`Element with index ${index} not found`);
+    }
+
+    try {
+      const isHidden = await element.isHidden();
+      if (!isHidden) {
+        await this._scrollIntoViewIfNeeded(element, 1000);
+      }
+    } catch (error) {
+      logger.debug(`Non-critical error preparing element for key press: ${error}`);
+    }
+
+    try {
+      await element.focus();
+    } catch (error) {
+      throw new Error(`Failed to focus element ${index}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    await this.pressKey(key);
   }
 
   private _convertKey(key: string): KeyInput {
@@ -1188,6 +1431,66 @@ export default class Page {
       logger.error(errorMsg);
       throw new Error(errorMsg);
     }
+  }
+
+  async setFilesOnElement(elementNode: DOMElementNode, paths: string[]): Promise<void> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer page is not connected');
+    }
+
+    const element = await this.locateElement(elementNode);
+    if (!element) {
+      throw new Error(`Element not found: ${elementNode}`);
+    }
+
+    await this._scrollIntoViewIfNeeded(element);
+    await (element as ElementHandle<HTMLInputElement>).uploadFile(...paths);
+  }
+
+  async hoverElementNode(elementNode: DOMElementNode): Promise<void> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer is not connected');
+    }
+
+    const element = await this.locateElement(elementNode);
+    if (!element) {
+      throw new Error(`Element not found: ${elementNode}`);
+    }
+
+    await this._scrollIntoViewIfNeeded(element);
+    await element.hover();
+  }
+
+  async dragBetweenElementNodes(startNode: DOMElementNode, endNode: DOMElementNode): Promise<void> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer is not connected');
+    }
+
+    const startElement = await this.locateElement(startNode);
+    const endElement = await this.locateElement(endNode);
+    if (!startElement || !endElement) {
+      throw new Error('Drag requires both start and end elements');
+    }
+
+    await this._scrollIntoViewIfNeeded(startElement);
+    await this._scrollIntoViewIfNeeded(endElement);
+
+    const startBox = await startElement.boundingBox();
+    const endBox = await endElement.boundingBox();
+    if (!startBox || !endBox) {
+      throw new Error('Failed to resolve drag coordinates');
+    }
+
+    const startX = startBox.x + startBox.width / 2;
+    const startY = startBox.y + startBox.height / 2;
+    const endX = endBox.x + endBox.width / 2;
+    const endY = endBox.y + endBox.height / 2;
+
+    await this._puppeteerPage.mouse.move(startX, startY);
+    await this._puppeteerPage.mouse.down();
+    await this._puppeteerPage.mouse.move(endX, endY, { steps: 20 });
+    await this._puppeteerPage.mouse.up();
+    await this.waitForPageAndFramesLoad();
   }
 
   /**

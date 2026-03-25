@@ -48,6 +48,71 @@ function createMockBrowserState(): BrowserState {
   };
 }
 
+function createPriorityMockBrowserState(): BrowserState {
+  const hiddenLink = new DOMElementNode({
+    tagName: 'a',
+    xpath: '/html/body/a[1]',
+    attributes: {
+      href: 'https://example.com/old',
+      title: 'Older result',
+    },
+    children: [new DOMTextNode('Older result', true)],
+    isVisible: true,
+    isInteractive: true,
+    isTopElement: false,
+    isInViewport: false,
+    highlightIndex: 3,
+  });
+
+  const searchOption = new DOMElementNode({
+    tagName: 'div',
+    xpath: '/html/body/div[1]',
+    attributes: {
+      role: 'option',
+      'aria-label': '杭州 周末 徒步攻略',
+      'aria-selected': 'true',
+    },
+    children: [new DOMTextNode('杭州 周末 徒步攻略', true)],
+    isVisible: true,
+    isInteractive: true,
+    isTopElement: true,
+    isInViewport: true,
+    highlightIndex: 28,
+  });
+
+  const root = new DOMElementNode({
+    tagName: 'root',
+    xpath: '',
+    attributes: {},
+    children: [hiddenLink, searchOption],
+    isVisible: true,
+  });
+  hiddenLink.parent = root;
+  searchOption.parent = root;
+
+  return {
+    elementTree: root,
+    selectorMap: new Map([
+      [3, hiddenLink],
+      [28, searchOption],
+    ]),
+    tabId: 101,
+    url: 'https://www.xiaohongshu.com/search_result',
+    title: 'Search Result',
+    screenshot: null,
+    scrollY: 0,
+    scrollHeight: 1000,
+    visualViewportHeight: 900,
+    tabs: [
+      {
+        id: 101,
+        url: 'https://www.xiaohongshu.com/search_result',
+        title: 'Search Result',
+      },
+    ],
+  };
+}
+
 describe('buildRemotePageState', () => {
   it('maps browser state into compact remote page state', () => {
     const state = buildRemotePageState(createMockBrowserState(), 'sess_demo', null, null);
@@ -62,6 +127,17 @@ describe('buildRemotePageState', () => {
       visible: true,
       enabled: true,
     });
+  });
+
+  it('prioritizes visible in-viewport suggestion elements for remote RPA', () => {
+    const state = buildRemotePageState(createPriorityMockBrowserState(), 'sess_priority', null, null);
+
+    expect(state.elements[0]).toMatchObject({
+      id: 'e28',
+      role: 'option',
+      label: '杭州 周末 徒步攻略',
+    });
+    expect(state.page_text_summary).toContain('[e28]');
   });
 });
 

@@ -136,7 +136,11 @@ export class RemoteConnectionManager {
     if (!this.settings) {
       return;
     }
-    if (!force && this.socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(this.socket.readyState)) {
+    if (
+      !force &&
+      this.socket &&
+      (this.socket.readyState === WebSocket.CONNECTING || this.socket.readyState === WebSocket.OPEN)
+    ) {
       return;
     }
 
@@ -182,6 +186,11 @@ export class RemoteConnectionManager {
       this.socket.onclose = () => {
         this.stopHeartbeat();
         this.socket = null;
+        logger.info('Remote bridge socket closed', {
+          pendingConfirmations: this.pendingConfirmations.size,
+          lastSessionId: this.status.session_id,
+          lastCommandId: this.status.last_command?.command_id || null,
+        });
 
         if (this.settings?.executionMode === 'remote' && this.settings.autoConnect) {
           this.status = {
@@ -259,7 +268,7 @@ export class RemoteConnectionManager {
       } catch (error) {
         logger.error('Failed to send heartbeat', error);
       }
-    }, HEARTBEAT_INTERVAL_MS);
+    }, HEARTBEAT_INTERVAL_MS) as unknown as number;
   }
 
   private stopHeartbeat(): void {
@@ -302,6 +311,7 @@ export class RemoteConnectionManager {
   }
 
   private async handleCommand(command: RemoteCommandEnvelope): Promise<void> {
+    const startedAt = Date.now();
     this.status = {
       ...this.status,
       session_id: command.session_id,
@@ -314,6 +324,21 @@ export class RemoteConnectionManager {
     });
 
     const result = await this.executor.execute(command);
+    logger.info('Remote command executed', {
+      action: command.action,
+      commandId: command.command_id,
+      sessionId: command.session_id,
+      ok: result.ok,
+      durationMs: Date.now() - startedAt,
+    });
+    if (command.action === 'arm_file_chooser' || command.action === 'arm_dialog') {
+      logger.info('Remote arm state updated', {
+        action: command.action,
+        commandId: command.command_id,
+        sessionId: command.session_id,
+        ok: result.ok,
+      });
+    }
     this.status = {
       ...this.status,
       last_result: result,
@@ -328,7 +353,8 @@ export class RemoteConnectionManager {
         result,
       });
 
-      const pageState = result.payload?.page_state as RemotePageState | undefined;
+      const payload = (result.payload || {}) as { page_state?: RemotePageState };
+      const pageState = payload.page_state;
       if (pageState) {
         this.send({
           type: 'page_state_event',
@@ -338,7 +364,13 @@ export class RemoteConnectionManager {
         });
       }
     } catch (error) {
-      logger.error('Failed to forward remote command result to bridge', error);
+      logger.error('Failed to forward remote command result to bridge', {
+        action: command.action,
+        commandId: command.command_id,
+        sessionId: command.session_id,
+        socketState: this.socket?.readyState ?? null,
+        error,
+      });
     }
 
     this.notifyUI({

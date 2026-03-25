@@ -230,6 +230,34 @@ export default class BrowserContext {
     return page;
   }
 
+  public async getCurrentTabInfo(): Promise<TabInfo | null> {
+    if (this._currentTabId) {
+      const tab = await chrome.tabs.get(this._currentTabId);
+      if (tab.id && tab.url && tab.title) {
+        return {
+          id: tab.id,
+          url: tab.url,
+          title: tab.title,
+        };
+      }
+    }
+
+    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!activeTab?.id || !activeTab.url || !activeTab.title) {
+      return null;
+    }
+
+    return {
+      id: activeTab.id,
+      url: activeTab.url,
+      title: activeTab.title,
+    };
+  }
+
+  public async resolveTabById(tabId: number): Promise<chrome.tabs.Tab> {
+    return await chrome.tabs.get(tabId);
+  }
+
   public async navigateTo(url: string): Promise<void> {
     if (!isUrlAllowed(url, this._config.allowedUrls, this._config.deniedUrls)) {
       throw new URLNotAllowedError(`URL: ${url} is not allowed`);
@@ -290,6 +318,23 @@ export default class BrowserContext {
     if (this._currentTabId === tabId) {
       this._currentTabId = null;
     }
+  }
+
+  public async resizeCurrentWindow(width: number, height: number): Promise<void> {
+    const currentTabInfo = await this.getCurrentTabInfo();
+    if (!currentTabInfo) {
+      throw new Error('No active tab available to resize');
+    }
+
+    const tab = await chrome.tabs.get(currentTabInfo.id);
+    if (typeof tab.windowId !== 'number') {
+      throw new Error('No browser window available to resize');
+    }
+
+    await chrome.windows.update(tab.windowId, {
+      width: Math.max(320, Math.floor(width)),
+      height: Math.max(240, Math.floor(height)),
+    });
   }
 
   /**
