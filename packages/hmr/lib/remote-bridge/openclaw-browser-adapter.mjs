@@ -2,6 +2,17 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
+import {
+  buildContentExtractMessage,
+  buildDefaultProbeScript,
+  buildXiaohongshuExpandScript,
+  buildXiaohongshuProbeScript,
+  createContentExtractResponse,
+  deriveMetadataFromPageState,
+  detectXiaohongshuNoteDetail,
+  normalizeStats,
+  parseCountValue,
+} from './content-extract-utils.mjs';
 
 const OPENCLAW_BROWSER_BASE = '/openclaw/browser';
 const DEFAULT_START_URL = 'about:blank';
@@ -33,7 +44,7 @@ function writeUnsupported(writeJson, res, kind, hint) {
     error: `Unsupported bridge browser action: ${kind}`,
     hint:
       hint ||
-      'Use tabs/open/focus/close, snapshot, screenshot, console, pdf, upload, dialog, and act(click/type/fill/press/hover/drag/select/resize/wait/evaluate/close/native) in bridge mode.',
+      'Use tabs/open/focus/close, snapshot, content/extract, screenshot, console, pdf, upload, dialog, and act(click/type/fill/press/hover/drag/select/resize/wait/evaluate/close/native) in bridge mode.',
   });
 }
 
@@ -518,6 +529,258 @@ async function fetchFreshPageState(ctx, params) {
   return pageState;
 }
 
+function normalizeText(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function mergeUniqueValues(...lists) {
+  const seen = new Set();
+  const merged = [];
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const value of list) {
+      const text = normalizeText(value);
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      merged.push(text);
+    }
+  }
+  return merged;
+}
+
+function pickFirstText(...values) {
+  for (const value of values) {
+    const text = normalizeText(value);
+    if (text) {
+      return text;
+    }
+  }
+  return null;
+}
+
+function mergeStats(...statsList) {
+  const merged = {};
+  for (const stats of statsList) {
+    const normalized = normalizeStats(stats || {});
+    for (const [key, value] of Object.entries(normalized)) {
+      if (!Object.hasOwn(merged, key)) {
+        merged[key] = value;
+      }
+    }
+  }
+  return merged;
+}
+
+function mapProbeStats(statsTexts = []) {
+  const values = Array.isArray(statsTexts)
+    ? statsTexts.map(value => parseCountValue(value)).filter(value => Number.isFinite(value))
+    : [];
+  if (values.length < 3) {
+    return {};
+  }
+  return {
+    favorites: values[0],
+    likes: values[1],
+    comments: values[2],
+  };
+}
+
+function buildContentResponse(response) {
+  const message = buildContentExtractMessage(response);
+  return message ? { ...response, message } : response;
+}
+
+async function runEvaluateScript(ctx, { sessionKey, session, fn }) {
+  const result = await runBridgeAction(ctx, {
+    sessionKey,
+    session,
+    action: 'evaluate_script',
+    args: { fn },
+  });
+  if (!result.ok) {
+    throw new Error(result.error || 'Bridge evaluate failed');
+  }
+  return {
+    value: result.payload?.result?.value,
+    pageState: result.payload?.page_state || session.last_page_state || null,
+  };
+}
+
+async function runExtractText(ctx, { sessionKey, session, mode, selector }) {
+  const result = await runBridgeAction(ctx, {
+    sessionKey,
+    session,
+    action: 'extract_text',
+    args: {
+      mode,
+      selector: selector || undefined,
+    },
+  });
+  if (!result.ok) {
+    throw new Error(result.error || `Bridge extract_text failed for ${mode}`);
+  }
+  return {
+    text: normalizeText(result.payload?.text),
+    pageState: result.payload?.page_state || session.last_page_state || null,
+  };
+}
+
+function selectContentExtractor(pageState, domainHint = '') {
+  const normalizedHint = normalizeText(domainHint).toLowerCase();
+  const url = normalizeText(pageState?.url);
+  const wantsXiaohongshu = normalizedHint === 'xiaohongshu' || url.includes('xiaohongshu.com');
+  if (wantsXiaohongshu) {
+    return {
+      key: 'xiaohongshu',
+      probeScript: buildXiaohongshuProbeScript(),
+      expandScript: buildXiaohongshuExpandScript(),
+      pageKind: detectXiaohongshuNoteDetail(pageState, normalizedHint) ? 'xiaohongshu_note_detail' : 'unknown',
+    };
+  }
+
+  return {
+    key: 'default',
+    probeScript: buildDefaultProbeScript(),
+    expandScript: null,
+    pageKind: 'unknown',
+  };
+}
+
+async function extractContent(ctx, { sessionKey, session, domainHint = '' }) {
+  let pageState = await fetchFreshPageState(ctx, {
+    sessionKey,
+    session,
+  });
+
+  const extractor = selectContentExtractor(pageState, domainHint);
+  const initialMeta = deriveMetadataFromPageState(pageState);
+
+  if (extractor.key === 'xiaohongshu' && extractor.pageKind !== 'xiaohongshu_note_detail') {
+    return buildContentResponse(
+      createContentExtractResponse({
+        pageState,
+        pageKind: 'unknown',
+        title: initialMeta.title,
+        author: initialMeta.author,
+        hashtags: initialMeta.hashtags,
+        stats: initialMeta.stats,
+        body: '',
+        extractedBy: 'page_state_only',
+        reason: 'not_detail_page',
+      }),
+    );
+  }
+
+  let expandFailed = false;
+  if (extractor.expandScript) {
+    try {
+      const expanded = await runEvaluateScript(ctx, {
+        sessionKey,
+        session,
+        fn: extractor.expandScript,
+      });
+      pageState = expanded.pageState || pageState;
+      if (expanded.value?.attempted && !expanded.value?.clicked && expanded.value?.reason !== 'not_found') {
+        expandFailed = true;
+      }
+    } catch {
+      expandFailed = true;
+    }
+  }
+
+  pageState = await fetchFreshPageState(ctx, {
+    sessionKey,
+    session,
+  });
+
+  const pageStateMeta = deriveMetadataFromPageState(pageState);
+  let probeData = {};
+  let evaluateFailed = false;
+  try {
+    const evaluated = await runEvaluateScript(ctx, {
+      sessionKey,
+      session,
+      fn: extractor.probeScript,
+    });
+    pageState = evaluated.pageState || pageState;
+    probeData = typeof evaluated.value === 'object' && evaluated.value !== null ? evaluated.value : {};
+  } catch {
+    evaluateFailed = true;
+  }
+
+  const mergedTitle = pickFirstText(probeData.title, pageStateMeta.title, initialMeta.title, pageState.title);
+  const mergedAuthor = pickFirstText(probeData.author, pageStateMeta.author, initialMeta.author);
+  const mergedHashtags = mergeUniqueValues(probeData.hashtags, pageStateMeta.hashtags, initialMeta.hashtags);
+  const mergedStats = mergeStats(mapProbeStats(probeData.statsTexts), pageStateMeta.stats, initialMeta.stats);
+  const containerSelector = normalizeText(probeData.containerSelector);
+  const visibleBodyChars = Number(probeData.visibleBodyChars) || 0;
+
+  let currentBody = pickFirstText(probeData.body, '');
+  let extractedBy = currentBody ? 'evaluate' : 'page_state_only';
+  let currentReason = evaluateFailed ? 'evaluate_error' : undefined;
+
+  const shouldReplaceBody = nextBody => normalizeText(nextBody).length > normalizeText(currentBody).length;
+
+  if ((!currentBody || normalizeText(currentBody).length < 200) && containerSelector) {
+    try {
+      const markdown = await runExtractText(ctx, {
+        sessionKey,
+        session,
+        mode: 'markdown',
+        selector: containerSelector,
+      });
+      pageState = markdown.pageState || pageState;
+      if (shouldReplaceBody(markdown.text)) {
+        currentBody = markdown.text;
+        extractedBy = 'extract_text_markdown';
+        currentReason = undefined;
+      }
+    } catch {
+      currentReason = currentReason || 'extract_text_error';
+    }
+  }
+
+  if (!currentBody || normalizeText(currentBody).length < 200) {
+    try {
+      const readability = await runExtractText(ctx, {
+        sessionKey,
+        session,
+        mode: 'readability',
+      });
+      pageState = readability.pageState || pageState;
+      if (shouldReplaceBody(readability.text)) {
+        currentBody = readability.text;
+        extractedBy = 'extract_text_readability';
+        currentReason = undefined;
+      }
+    } catch {
+      currentReason = currentReason || 'extract_text_error';
+    }
+  }
+
+  const refreshedMeta = deriveMetadataFromPageState(pageState);
+  if ((!currentBody || normalizeText(currentBody).length < 120) && shouldReplaceBody(refreshedMeta.body)) {
+    currentBody = refreshedMeta.body;
+    extractedBy = extractedBy === 'page_state_only' ? 'page_state_only' : extractedBy;
+  }
+
+  const response = createContentExtractResponse({
+    pageState,
+    pageKind: extractor.pageKind,
+    title: pickFirstText(mergedTitle, refreshedMeta.title, pageState.title),
+    author: pickFirstText(mergedAuthor, refreshedMeta.author),
+    hashtags: mergeUniqueValues(mergedHashtags, refreshedMeta.hashtags),
+    stats: mergeStats(mergedStats, refreshedMeta.stats),
+    body: currentBody,
+    extractedBy,
+    reason: currentReason || (expandFailed ? 'expand_failed' : undefined),
+    containerSelector,
+    visibleBodyChars,
+  });
+
+  return buildContentResponse(response);
+}
+
 async function saveBase64Artifact(baseDir, base64Value, extension) {
   if (typeof base64Value !== 'string' || !base64Value.trim()) {
     throw new Error('Bridge artifact payload missing data');
@@ -854,6 +1117,32 @@ export function createOpenClawBrowserAdapter(ctx) {
           labels: Boolean(url.searchParams.get('labels')),
           labelsCount: 0,
           labelsSkipped: Boolean(url.searchParams.get('labels')),
+        });
+        return true;
+      }
+
+      if (req.method === 'POST' && relativePath === '/content/extract') {
+        const body = await readJson(req);
+        const targetId = normalizeText(body.targetId || url.searchParams.get('targetId') || '');
+        const domainHint = normalizeText(body.domainHint || url.searchParams.get('domainHint') || '');
+        const session = await ensureBridgeSession(ctx, {
+          sessionKey,
+          deviceId,
+          targetId,
+        });
+        if (targetId) {
+          await ensureTargetFocused(ctx, sessionKey, session, targetId);
+        }
+
+        const extraction = await extractContent(ctx, {
+          sessionKey,
+          session,
+          domainHint,
+        });
+
+        writeJson(res, 200, {
+          ...extraction,
+          targetId: session.active_target_id || targetId || null,
         });
         return true;
       }
