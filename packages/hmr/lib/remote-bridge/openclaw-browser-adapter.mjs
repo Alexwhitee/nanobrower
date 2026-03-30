@@ -22,7 +22,26 @@ const PDF_DIR = path.join(os.tmpdir(), 'openclaw-bridge', 'browser-pdfs');
 const DEVICE_READY_WAIT_MS = 8000;
 const DEVICE_READY_POLL_MS = 500;
 const MAX_AI_SNAPSHOT_ELEMENTS = 25;
-const DEFAULT_SNAPSHOT_MAX_CHARS = 6000;
+const DEFAULT_SNAPSHOT_MAX_CHARS = 3500;
+const DEFAULT_ACTION_PAGE_SUMMARY_CHARS = 700;
+const DEFAULT_ACTION_TEXT_CHARS = 1600;
+const DEFAULT_ACTION_ELEMENT_LIMIT = 8;
+const STRUCTURAL_ELEMENT_ROLES = new Set(['generic', 'div', 'span', 'section', 'article', 'li', 'ul', 'ol', 'p']);
+const ROLE_PRIORITY = new Map([
+  ['searchbox', 120],
+  ['textbox', 110],
+  ['combobox', 105],
+  ['button', 100],
+  ['link', 95],
+  ['menuitem', 92],
+  ['tab', 90],
+  ['checkbox', 85],
+  ['radio', 85],
+  ['option', 82],
+  ['listbox', 80],
+  ['dialog', 78],
+  ['img', 70],
+]);
 
 const openClawSessionMappings = new Map();
 
@@ -112,15 +131,103 @@ function buildSnapshotLine(element, compact = true) {
   return `- ${parts.join(' ')}`;
 }
 
+function pickTrimmedString(...values) {
+  for (const value of values) {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed) {
+        return trimmed;
+      }
+    }
+  }
+  return '';
+}
+
+function parseInteger(value, fallback) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.floor(value);
+  }
+  if (typeof value === 'string') {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return fallback;
+}
+
+function collapseWhitespace(value) {
+  return pickTrimmedString(value).replace(/\s+/g, ' ').trim();
+}
+
+function buildPreviewText(value, maxChars = DEFAULT_ACTION_TEXT_CHARS) {
+  return capText(collapseWhitespace(value), maxChars);
+}
+
+function buildPreviewUrl(value, maxChars = 160) {
+  return capText(pickTrimmedString(value), maxChars);
+}
+
+function parseBooleanFlag(value, fallback = false) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true' || normalized === '1' || normalized === 'yes') {
+      return true;
+    }
+    if (normalized === 'false' || normalized === '0' || normalized === 'no') {
+      return false;
+    }
+  }
+  return fallback;
+}
+
+function scoreSnapshotElement(element, index) {
+  const role = pickTrimmedString(element?.role).toLowerCase() || 'generic';
+  const label = pickTrimmedString(element?.label);
+  const text = pickTrimmedString(element?.text);
+  const value = pickTrimmedString(element?.value);
+  const url = pickTrimmedString(element?.url);
+  const selector = pickTrimmedString(element?.selector).toLowerCase();
+  const combinedText = `${label} ${text}`.trim();
+
+  let score = ROLE_PRIORITY.get(role) || 50;
+
+  if (element?.visible !== false) score += 24;
+  else score -= 60;
+
+  if (element?.enabled !== false) score += 8;
+  else score -= 24;
+
+  if (label) score += Math.min(label.length, 40);
+  if (text && text !== label) score += Math.min(text.length, 28);
+  if (value) score += Math.min(value.length, 18);
+  if (url) score += 20;
+  if (selector.includes('search')) score += 40;
+  if (/搜索|search/.test(combinedText)) score += 36;
+  if (/笔记|结果|详情|作者|评论|收藏|点赞|更多|展开/.test(combinedText)) score += 12;
+  if (/\/explore\/|\/search_result|\/user\/profile\//.test(url)) score += 18;
+  if (combinedText.length > 100) score -= 8;
+
+  if (STRUCTURAL_ELEMENT_ROLES.has(role) && !label && !text && !value && !url) {
+    score -= 80;
+  } else if (STRUCTURAL_ELEMENT_ROLES.has(role) && !label && !url) {
+    score -= 20;
+  }
+
+  return {
+    element,
+    index,
+    score,
+  };
+}
+
 function filterSnapshotElements(pageState, query = {}) {
   const selector = typeof query.selector === 'string' ? query.selector.trim() : '';
   const interactive = query.interactive === true || query.interactive === 'true';
-  const limit =
-    typeof query.limit === 'number'
-      ? query.limit
-      : typeof query.limit === 'string'
-        ? Number.parseInt(query.limit, 10)
-        : MAX_AI_SNAPSHOT_ELEMENTS;
+  const limit = parseInteger(query.limit, MAX_AI_SNAPSHOT_ELEMENTS);
   let elements = Array.isArray(pageState.elements) ? [...pageState.elements] : [];
 
   if (selector) {
@@ -132,7 +239,14 @@ function filterSnapshotElements(pageState, query = {}) {
   }
 
   if (Number.isFinite(limit) && limit > 0) {
-    elements = elements.slice(0, Math.floor(limit));
+    elements = elements
+      .map((element, index) => scoreSnapshotElement(element, index))
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return a.index - b.index;
+      })
+      .slice(0, Math.floor(limit))
+      .map(entry => entry.element);
   }
 
   return elements;
@@ -149,12 +263,7 @@ function capText(text, maxChars) {
 }
 
 function buildAiSnapshot(pageState, query = {}) {
-  const maxChars =
-    typeof query.maxChars === 'number'
-      ? query.maxChars
-      : typeof query.maxChars === 'string'
-        ? Number.parseInt(query.maxChars, 10)
-        : DEFAULT_SNAPSHOT_MAX_CHARS;
+  const maxChars = parseInteger(query.maxChars, DEFAULT_SNAPSHOT_MAX_CHARS);
   const compact = query.compact !== false && query.compact !== 'false';
   const lines = [`Page Title: ${pageState.title || '(untitled)'}`, `Page URL: ${pageState.url || '(unknown)'}`];
 
@@ -163,7 +272,9 @@ function buildAiSnapshot(pageState, query = {}) {
   }
 
   const elements = filterSnapshotElements(pageState, query);
-  lines.push(`Interactive Elements (${elements.length}/${Array.isArray(pageState.elements) ? pageState.elements.length : 0}):`);
+  lines.push(
+    `Interactive Elements (${elements.length}/${Array.isArray(pageState.elements) ? pageState.elements.length : 0}):`,
+  );
   for (const element of elements) {
     lines.push(buildSnapshotLine(element, compact));
   }
@@ -179,6 +290,156 @@ function buildAiSnapshot(pageState, query = {}) {
       returned: elements.length,
     },
   };
+}
+
+function buildCompactElement(element) {
+  const label = pickTrimmedString(element?.label);
+  const text = pickTrimmedString(element?.text);
+  const value = pickTrimmedString(element?.value);
+  const url = pickTrimmedString(element?.url);
+
+  return {
+    ref: pickTrimmedString(element?.id) || undefined,
+    role: pickTrimmedString(element?.role) || 'generic',
+    label: label || undefined,
+    text: text && text !== label ? buildPreviewText(text, 120) : undefined,
+    value: value ? buildPreviewText(value, 80) : undefined,
+    url: url ? buildPreviewUrl(url) : undefined,
+  };
+}
+
+function buildCompactPageState(pageState, query = {}) {
+  if (!pageState || typeof pageState !== 'object') {
+    return null;
+  }
+
+  const elements = filterSnapshotElements(pageState, {
+    selector: query.selector || '',
+    interactive: query.interactive ?? true,
+    limit: parseInteger(query.limit, DEFAULT_ACTION_ELEMENT_LIMIT),
+  });
+
+  return {
+    url: pickTrimmedString(pageState.url) || '',
+    title: pickTrimmedString(pageState.title) || '',
+    summary:
+      buildPreviewText(
+        pageState.page_text_summary || '',
+        parseInteger(query.maxChars, DEFAULT_ACTION_PAGE_SUMMARY_CHARS),
+      ) || undefined,
+    elements: elements.map(buildCompactElement),
+    stats: {
+      total: Array.isArray(pageState.elements) ? pageState.elements.length : 0,
+      returned: elements.length,
+    },
+  };
+}
+
+function summarizeActionValue(value) {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+  if (typeof value === 'string') {
+    return {
+      type: 'string',
+      chars: value.length,
+      preview: buildPreviewText(value),
+    };
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return {
+      type: 'array',
+      items: value.length,
+      preview: value.slice(0, 5).map(entry => {
+        if (typeof entry === 'string') return buildPreviewText(entry, 120);
+        if (entry && typeof entry === 'object') return Object.keys(entry).slice(0, 6);
+        return entry;
+      }),
+    };
+  }
+  if (typeof value === 'object') {
+    return {
+      type: 'object',
+      keys: Object.keys(value).slice(0, 12),
+    };
+  }
+  return String(value);
+}
+
+function buildCompactActionPayload(kind, payload) {
+  if (!payload || typeof payload !== 'object') {
+    return payload ?? null;
+  }
+
+  const compact = {};
+  const message = pickTrimmedString(payload.message);
+  if (message) {
+    compact.message = message;
+  }
+
+  if (Object.hasOwn(payload, 'navigated')) {
+    compact.navigated = Boolean(payload.navigated);
+  }
+  if (Object.hasOwn(payload, 'bridgeAliasedFrom')) {
+    compact.bridgeAliasedFrom = payload.bridgeAliasedFrom;
+  }
+  if (Object.hasOwn(payload, 'nativeAction')) {
+    compact.nativeAction = payload.nativeAction;
+  }
+  if (Object.hasOwn(payload, 'screenshot_ref')) {
+    compact.screenshotRef = payload.screenshot_ref;
+  }
+  if (Object.hasOwn(payload, 'value')) {
+    compact.value = summarizeActionValue(payload.value);
+  }
+  if (typeof payload.text === 'string') {
+    compact.text = buildPreviewText(payload.text);
+  }
+  if (Array.isArray(payload.messages)) {
+    compact.messages = {
+      count: payload.messages.length,
+      preview: payload.messages.slice(0, 3).map(messageValue => buildPreviewText(String(messageValue || ''), 160)),
+    };
+  }
+  if (payload.policy && typeof payload.policy === 'object') {
+    compact.policy = payload.policy;
+  }
+  if (payload.extraction && typeof payload.extraction === 'object') {
+    compact.extraction = {
+      ok: payload.extraction.ok !== false,
+      url: pickTrimmedString(payload.extraction.url) || undefined,
+      pageKind: pickTrimmedString(payload.extraction.pageKind) || undefined,
+      title: pickTrimmedString(payload.extraction.title) || undefined,
+      author: pickTrimmedString(payload.extraction.author) || undefined,
+      stats: payload.extraction.stats || undefined,
+      bodyChars: payload.extraction.bodyChars ?? undefined,
+      bodyPreview:
+        typeof payload.extraction.body === 'string'
+          ? buildPreviewText(payload.extraction.body, DEFAULT_ACTION_TEXT_CHARS)
+          : undefined,
+      extractedBy: pickTrimmedString(payload.extraction.extractedBy) || undefined,
+      completeness: pickTrimmedString(payload.extraction.completeness) || undefined,
+      reason: pickTrimmedString(payload.extraction.reason) || undefined,
+    };
+  }
+
+  const pageState = payload.page_state || payload.pageState || null;
+  const compactPage = buildCompactPageState(pageState);
+  if (compactPage) {
+    compact.page = compactPage;
+  }
+
+  if (!Object.keys(compact).length) {
+    return {
+      kind,
+      keys: Object.keys(payload).slice(0, 12),
+    };
+  }
+
+  return compact;
 }
 
 function buildAriaNode(element) {
@@ -972,7 +1233,8 @@ export function createOpenClawBrowserAdapter(ctx) {
           return true;
         }
 
-        const tab = result.payload?.tab || Object.values(session.tabs_by_target_id || {}).find(entry => entry.active) || null;
+        const tab =
+          result.payload?.tab || Object.values(session.tabs_by_target_id || {}).find(entry => entry.active) || null;
         writeJson(res, 200, {
           ok: true,
           targetId: tab?.target_id || tab?.targetId || session.active_target_id,
@@ -1374,9 +1636,19 @@ export function createOpenClawBrowserAdapter(ctx) {
       }
 
       if (req.method === 'POST' && relativePath === '/act') {
-        const body = await readJson(req);
+        const rawBody = await readJson(req);
+        const body =
+          typeof rawBody.request === 'object' && rawBody.request !== null
+            ? {
+                ...rawBody.request,
+                ...rawBody,
+              }
+            : rawBody;
+        delete body.request;
+
         const kind = typeof body.kind === 'string' ? body.kind.trim() : '';
         const targetId = typeof body.targetId === 'string' ? body.targetId.trim() : '';
+        const verbose = parseBooleanFlag(body.verbose ?? url.searchParams.get('verbose'), false);
         const session = await ensureBridgeSession(ctx, {
           sessionKey,
           deviceId,
@@ -1395,7 +1667,7 @@ export function createOpenClawBrowserAdapter(ctx) {
         let result;
         switch (kind) {
           case 'click': {
-            const ref = typeof body.ref === 'string' ? body.ref.trim() : '';
+            const ref = pickTrimmedString(body.ref, body.inputRef);
             if (!ref) {
               writeJson(res, 400, { error: 'ref is required for click' });
               return true;
@@ -1409,7 +1681,7 @@ export function createOpenClawBrowserAdapter(ctx) {
             break;
           }
           case 'type': {
-            const ref = typeof body.ref === 'string' ? body.ref.trim() : '';
+            const ref = pickTrimmedString(body.ref, body.inputRef);
             const text = typeof body.text === 'string' ? body.text : '';
             if (!ref || !text) {
               writeJson(res, 400, { error: 'ref and text are required for type' });
@@ -1424,7 +1696,7 @@ export function createOpenClawBrowserAdapter(ctx) {
             break;
           }
           case 'fill': {
-            const ref = typeof body.ref === 'string' ? body.ref.trim() : '';
+            const ref = pickTrimmedString(body.ref, body.inputRef);
             const text = typeof body.text === 'string' ? body.text : '';
             if (!ref || !text) {
               writeJson(res, 400, { error: 'ref and text are required for fill' });
@@ -1449,7 +1721,7 @@ export function createOpenClawBrowserAdapter(ctx) {
           }
           case 'press': {
             const key = typeof body.key === 'string' ? body.key.trim() : '';
-            const ref = typeof body.ref === 'string' ? body.ref.trim() : '';
+            const ref = pickTrimmedString(body.ref, body.inputRef);
             if (!key) {
               writeJson(res, 400, { error: 'key is required for press' });
               return true;
@@ -1466,7 +1738,7 @@ export function createOpenClawBrowserAdapter(ctx) {
             break;
           }
           case 'hover': {
-            const ref = typeof body.ref === 'string' ? body.ref.trim() : '';
+            const ref = pickTrimmedString(body.ref, body.inputRef);
             if (!ref) {
               writeJson(res, 400, { error: 'ref is required for hover' });
               return true;
@@ -1498,7 +1770,7 @@ export function createOpenClawBrowserAdapter(ctx) {
             break;
           }
           case 'select': {
-            const ref = typeof body.ref === 'string' ? body.ref.trim() : '';
+            const ref = pickTrimmedString(body.ref, body.inputRef);
             const value = Array.isArray(body.values) ? String(body.values[0] || '') : '';
             if (!ref || !value) {
               writeJson(res, 400, { error: 'ref and at least one value are required for select' });
@@ -1589,11 +1861,27 @@ export function createOpenClawBrowserAdapter(ctx) {
           }
           case 'native': {
             const nativeAction = typeof body.nativeAction === 'string' ? body.nativeAction.trim() : '';
-            const nativeArgs =
-              typeof body.nativeArgs === 'object' && body.nativeArgs !== null ? body.nativeArgs : {};
+            const nativeArgs = typeof body.nativeArgs === 'object' && body.nativeArgs !== null ? body.nativeArgs : {};
             if (!nativeAction) {
               writeJson(res, 400, { error: 'nativeAction is required for native bridge actions' });
               return true;
+            }
+            if (nativeAction === 'content/extract') {
+              const extraction = await extractContent(ctx, {
+                sessionKey,
+                session,
+                domainHint: pickTrimmedString(body.domainHint, nativeArgs.domainHint),
+              });
+              result = {
+                ok: true,
+                payload: {
+                  bridgeAliasedFrom: 'native:content/extract',
+                  nativeAction,
+                  extraction,
+                  page_state: session.last_page_state || null,
+                },
+              };
+              break;
             }
             result = await runBridgeAction(ctx, {
               sessionKey,
@@ -1625,7 +1913,7 @@ export function createOpenClawBrowserAdapter(ctx) {
           url: result.payload?.page_state?.url || session.last_page_state?.url || '',
           confirmationStatus: session.last_confirmation_status || null,
           nativeAction: kind === 'native' ? body.nativeAction || null : undefined,
-          result: result.payload || null,
+          result: verbose ? result.payload || null : buildCompactActionPayload(kind, result.payload || {}),
         });
         return true;
       }
